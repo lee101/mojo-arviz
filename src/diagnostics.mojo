@@ -1,6 +1,5 @@
 """Posterior diagnostic kernels exposed through a stable C ABI."""
 
-from std.algorithm import parallelize
 from std.math import cos, log, sin, sqrt
 from std.sys.info import simd_width_of
 
@@ -277,7 +276,7 @@ def rank_normalize_impl(
     while i + W <= n:
         sorted_values.store(i, source.load[width=W](i))
         var index_values = SIMD[DType.float64, W]()
-        comptime for lane in range(W):
+        comptime for lane in range(Int(W)):
             index_values[lane] = Float64(i + lane)
         indices.store(i, index_values)
         i += W
@@ -347,11 +346,8 @@ def mav_rank_normalize_pair(
                 n,
             )
 
-    if n >= 65536:
-        parallelize[normalize](2, 2)
-    else:
-        normalize(0)
-        normalize(1)
+    normalize(0)
+    normalize(1)
 
 
 @export("mav_rhat")
@@ -526,11 +522,8 @@ def mav_ess(
             acov[chain * draws + lag] = chain_real[lag] * scale
             lag += 1
 
-    if chains > 1 and chains * draws >= 32768:
-        parallelize[process_chain](chains, min(chains, 8))
-    else:
-        for chain in range(chains):
-            process_chain(chain)
+    for chain in range(chains):
+        process_chain(chain)
 
     return ess_finish(values, acov, rho, chains, draws, draws, relative)
 
