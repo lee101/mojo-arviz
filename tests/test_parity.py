@@ -121,9 +121,10 @@ def test_autocorrelated_ess():
     assert_close(maz.ess(values, method="identity"), az.ess(values, method="identity"), atol=1e-8)
 
 
-def test_ess_simd_tail_and_native_parallel_threshold():
+@pytest.mark.parametrize(("chains", "draw_count"), [(3, 8191), (4, 8193)])
+def test_ess_simd_tail_and_native_parallel_threshold(chains, draw_count):
     rng = np.random.default_rng(61)
-    values = rng.normal(size=(4, 8193))
+    values = rng.normal(size=(chains, draw_count))
     assert_close(
         maz.ess(values, method="identity"),
         az.ess(values, method="identity"),
@@ -133,7 +134,7 @@ def test_ess_simd_tail_and_native_parallel_threshold():
 
 def test_ess_batched_fft_threshold():
     rng = np.random.default_rng(62)
-    noise = rng.normal(size=(4, 16384))
+    noise = rng.normal(size=(4, 16385))
     values = np.empty_like(noise)
     values[:, 0] = noise[:, 0]
     for draw in range(1, values.shape[1]):

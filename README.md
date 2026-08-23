@@ -80,11 +80,13 @@ Buffers cross the C boundary as integer addresses; Mojo reconstructs
 memory remains owned by NumPy, so the shared library performs no cross-language allocation.
 One compilation unit produces `dist/libmojo-arviz.so`.
 
-The ESS kernel uses an in-place Mojo radix-two FFT for smaller arrays and a batched NumPy
-real FFT for large arrays, then passes the contiguous autocovariance buffer to Mojo without
-copying for Geyer's initial-positive and initial-monotone sequences. Large native FFT jobs
-parallelize across chains. Contiguous FFT setup, scaling, power, copy, and reduction loops
-use host-width float64 SIMD with scalar tails.
+The ESS kernel uses an in-place Mojo radix-two FFT for arrays up to 65,536 values and a
+batched NumPy real FFT above that cutoff. Native FFT butterflies, range scans, setup,
+scaling, power, and reduction loops use host-width float64 SIMD with scalar tails. Native
+jobs with at least 131,072 padded chain values parallelize across independent chains; smaller
+jobs remain serial. The inverse-FFT buffer is consumed directly by Geyer's
+initial-positive and initial-monotone sequences, avoiding a separate autocovariance buffer
+and copy.
 
 Rank diagnostics use a Mojo quicksort, tie-aware average ranks, Blom's rank back-transform,
 and a standalone inverse-normal approximation. Rank buffer initialization is SIMD
@@ -92,7 +94,10 @@ vectorized, and large rank R-hat jobs normalize the bulk and folded arrays concu
 Nearest HDI uses NumPy's optimized sort once and passes that buffer zero-copy to Mojo for
 shortest-window selection.
 
-No GPU path is included.
+No GPU path is included. The FFT butterfly performs roughly 10 floating-point operations
+while moving at least 32 bytes per stage, below the requested two-flops-per-byte threshold;
+the other kernels are sorting, bandwidth, or branch dominated. Host/device transfers and
+launches would therefore make these paths slower rather than useful.
 
 ## Correctness and tests
 
@@ -115,11 +120,11 @@ Versions: mojoarviz 0.1.0; ArViZ 1.2.0; NumPy 2.5.1.
 
 | case | mojoarviz | ArviZ | ArViZ / Mojo | result |
 |---|---:|---:|---:|---|
-| R-hat identity (4 x 1,000,000) | 17.77 ms | 65.54 ms | 3.69x | faster |
-| R-hat rank (4 x 100,000) | 98.41 ms | 184.83 ms | 1.88x | faster |
-| ESS identity AR(1) (4 x 16,384) | 4.47 ms | 4.04 ms | 0.90x | slower |
-| ESS bulk AR(1) (4 x 16,384) | 11.51 ms | 15.86 ms | 1.38x | faster |
-| HDI nearest (1,000,000) | 24.79 ms | 21.26 ms | 0.86x | slower |
+| R-hat identity (4 x 1,000,000) | 18.78 ms | 152.62 ms | 8.13x | faster |
+| R-hat rank (4 x 100,000) | 111.18 ms | 171.97 ms | 1.55x | faster |
+| ESS identity AR(1) (4 x 16,384) | 2.90 ms | 5.19 ms | 1.79x | faster |
+| ESS bulk AR(1) (4 x 16,384) | 9.29 ms | 16.00 ms | 1.72x | faster |
+| HDI nearest (1,000,000) | 24.43 ms | 26.31 ms | 1.08x | faster |
 
 To reproduce:
 

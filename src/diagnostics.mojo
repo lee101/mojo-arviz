@@ -1,10 +1,13 @@
 """Posterior diagnostic kernels exposed through a stable C ABI."""
 
+from max.algorithm import parallelize
 from std.math import cos, log, sin, sqrt
+from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
 
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime PI = 3.14159265358979323846264338327950288
+comptime PARALLEL_FFT_WORK = 131072
 
 
 def p(addr: Int) -> Ptr:
@@ -180,6 +183,7 @@ def normal_ppf(prob: Float64) -> Float64:
 
 
 def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
+    comptime W = simd_width_of[DType.float64]()
     var j = 0
     for i in range(1, n):
         var bit = n >> 1
@@ -200,24 +204,58 @@ def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
         var angle = (2.0 if inverse else -2.0) * PI / Float64(length)
         var step_r = cos(angle)
         var step_i = sin(angle)
+        var initial_wr = SIMD[DType.float64, W]()
+        var initial_wi = SIMD[DType.float64, W]()
+        var next_wr = 1.0
+        var next_wi = 0.0
+        comptime for lane in range(Int(W)):
+            initial_wr[lane] = next_wr
+            initial_wi[lane] = next_wi
+            var advanced_wr = next_wr * step_r - next_wi * step_i
+            next_wi = next_wr * step_i + next_wi * step_r
+            next_wr = advanced_wr
+        var stride_r = next_wr
+        var stride_i = next_wi
         var base = 0
         while base < n:
-            var wr = 1.0
-            var wi = 0.0
-            for offset in range(length // 2):
+            var wr = initial_wr
+            var wi = initial_wi
+            var offset = 0
+            var half = length // 2
+            while offset + W <= half:
                 var even = base + offset
-                var odd = even + length // 2
-                var tr = wr * real[odd] - wi * imag[odd]
-                var ti = wr * imag[odd] + wi * real[odd]
+                var odd = even + half
+                var odd_real = real.load[width=W](odd)
+                var odd_imag = imag.load[width=W](odd)
+                var tr = wr * odd_real - wi * odd_imag
+                var ti = wr * odd_imag + wi * odd_real
+                var even_real = real.load[width=W](even)
+                var even_imag = imag.load[width=W](even)
+                real.store(even, even_real + tr)
+                imag.store(even, even_imag + ti)
+                real.store(odd, even_real - tr)
+                imag.store(odd, even_imag - ti)
+                var advanced_wr = wr * stride_r - wi * stride_i
+                wi = wr * stride_i + wi * stride_r
+                wr = advanced_wr
+                offset += W
+            var scalar_wr = wr[0]
+            var scalar_wi = wi[0]
+            while offset < half:
+                var even = base + offset
+                var odd = even + half
+                var tr = scalar_wr * real[odd] - scalar_wi * imag[odd]
+                var ti = scalar_wr * imag[odd] + scalar_wi * real[odd]
                 var er = real[even]
                 var ei = imag[even]
                 real[even] = er + tr
                 imag[even] = ei + ti
                 real[odd] = er - tr
                 imag[odd] = ei - ti
-                var next_wr = wr * step_r - wi * step_i
-                wi = wr * step_i + wi * step_r
-                wr = next_wr
+                var advanced_wr = scalar_wr * step_r - scalar_wi * step_i
+                scalar_wi = scalar_wr * step_i + scalar_wi * step_r
+                scalar_wr = advanced_wr
+                offset += 1
             base += length
         length <<= 1
 
@@ -362,13 +400,14 @@ def ess_finish(
     chains: Int,
     draws: Int,
     acov_stride: Int,
+    acov_scale: Float64,
     relative: Int,
 ) -> Float64:
     comptime W = simd_width_of[DType.float64]()
     var mean_acov0 = 0.0
     var chain_mean_mean = 0.0
     for chain in range(chains):
-        mean_acov0 += acov[chain * acov_stride]
+        mean_acov0 += acov[chain * acov_stride] * acov_scale
         var mean = sum_values(values, chain * draws, draws)
         chain_mean_mean += mean / Float64(draws)
     mean_acov0 /= Float64(chains)
@@ -393,7 +432,7 @@ def ess_finish(
     rho[0] = 1.0
     var mean_acov1 = 0.0
     for chain in range(chains):
-        mean_acov1 += acov[chain * acov_stride + 1]
+        mean_acov1 += acov[chain * acov_stride + 1] * acov_scale
     mean_acov1 /= Float64(chains)
     var rho_even = 1.0
     var rho_odd = 1.0 - (mean_var - mean_acov1) / var_plus
@@ -404,8 +443,8 @@ def ess_finish(
         var acov_even = 0.0
         var acov_odd = 0.0
         for chain in range(chains):
-            acov_even += acov[chain * acov_stride + t + 1]
-            acov_odd += acov[chain * acov_stride + t + 2]
+            acov_even += acov[chain * acov_stride + t + 1] * acov_scale
+            acov_odd += acov[chain * acov_stride + t + 2] * acov_scale
         acov_even /= Float64(chains)
         acov_odd /= Float64(chains)
         rho_even = 1.0 - (mean_var - acov_even) / var_plus
@@ -441,7 +480,6 @@ def ess_finish(
 @export("mav_ess")
 def mav_ess(
     values_addr: Int,
-    acov_addr: Int,
     real_addr: Int,
     imag_addr: Int,
     rho_addr: Int,
@@ -451,14 +489,27 @@ def mav_ess(
     relative: Int,
 ) abi("C") -> Float64:
     var values = p(values_addr)
-    var acov = p(acov_addr)
     var real = p(real_addr)
     var imag = p(imag_addr)
     var rho = p(rho_addr)
 
-    var minimum = values[0]
-    var maximum = values[0]
-    for i in range(1, chains * draws):
+    comptime W = simd_width_of[DType.float64]()
+    var minimum_values = SIMD[DType.float64, W](values[0])
+    var maximum_values = minimum_values
+    var scan = 0
+    while scan + W <= chains * draws:
+        var current = values.load[width=W](scan)
+        minimum_values = min(minimum_values, current)
+        maximum_values = max(maximum_values, current)
+        scan += W
+    var minimum = minimum_values[0]
+    var maximum = maximum_values[0]
+    comptime for lane in range(1, Int(W)):
+        if minimum_values[lane] < minimum:
+            minimum = minimum_values[lane]
+        if maximum_values[lane] > maximum:
+            maximum = maximum_values[lane]
+    for i in range(scan, chains * draws):
         if values[i] < minimum:
             minimum = values[i]
         if values[i] > maximum:
@@ -466,10 +517,9 @@ def mav_ess(
     if maximum - minimum < 1.0e-15:
         return Float64(chains * draws)
 
-    comptime W = simd_width_of[DType.float64]()
-
-    @parameter
-    def process_chain(chain: Int):
+    def process_chain(
+        chain: Int,
+    ) {imm values, imm real, imm imag, imm chains, imm draws, imm fft_n}:
         var mean = sum_values(values, chain * draws, draws) / Float64(draws)
         var chain_real = real + chain * fft_n
         var chain_imag = imag + chain * fft_n
@@ -510,22 +560,24 @@ def mav_ess(
             chain_imag[i] = 0.0
             i += 1
         fft(chain_real, chain_imag, fft_n, True)
-        var lag = 0
-        var scale = 1.0 / Float64(draws)
-        while lag + W <= draws:
-            acov.store(
-                chain * draws + lag,
-                chain_real.load[width=W](lag) * scale,
-            )
-            lag += W
-        while lag < draws:
-            acov[chain * draws + lag] = chain_real[lag] * scale
-            lag += 1
 
-    for chain in range(chains):
-        process_chain(chain)
+    if chains > 1 and chains * fft_n >= PARALLEL_FFT_WORK:
+        initialize_runtime()
+        parallelize(process_chain, chains, min(chains, 8))
+    else:
+        for chain in range(chains):
+            process_chain(chain)
 
-    return ess_finish(values, acov, rho, chains, draws, draws, relative)
+    return ess_finish(
+        values,
+        real,
+        rho,
+        chains,
+        draws,
+        fft_n,
+        1.0 / Float64(draws),
+        relative,
+    )
 
 
 @export("mav_ess_from_acov")
@@ -545,6 +597,7 @@ def mav_ess_from_acov(
         chains,
         draws,
         acov_stride,
+        1.0 / Float64(draws),
         relative,
     )
 

@@ -19,7 +19,7 @@ _SIGNATURES = {
     "mav_rank_normalize": ([I, I, I, I, I], None),
     "mav_rank_normalize_pair": ([I, I, I, I, I, I, I, I, I], None),
     "mav_rhat": ([I, I, I], F),
-    "mav_ess": ([I, I, I, I, I, I, I, I, I], F),
+    "mav_ess": ([I, I, I, I, I, I, I, I], F),
     "mav_ess_from_acov": ([I, I, I, I, I, I, I], F),
     "mav_hdi_nearest": ([I, I, I, I], None),
 }
@@ -159,7 +159,7 @@ def core_ess(values: np.ndarray, relative: bool = False) -> float:
     while fft_n < 2 * draws:
         fft_n <<= 1
     rho = np.empty(draws, dtype=np.float64)
-    if array.size >= 65536:
+    if array.size > 65536:
         centered = array - array.mean(axis=1, keepdims=True)
         spectrum = np.fft.rfft(centered, n=fft_n, axis=1)
         spectrum.real *= spectrum.real
@@ -167,7 +167,6 @@ def core_ess(values: np.ndarray, relative: bool = False) -> float:
         spectrum.real += spectrum.imag
         spectrum.imag.fill(0.0)
         acov = np.fft.irfft(spectrum, n=fft_n, axis=1)
-        acov /= draws
         return float(
             lib().mav_ess_from_acov(
                 addr(array),
@@ -179,13 +178,12 @@ def core_ess(values: np.ndarray, relative: bool = False) -> float:
                 int(relative),
             )
         )
-    acov = np.empty((chains, draws), dtype=np.float64)
-    real = np.empty(chains * fft_n, dtype=np.float64)
-    imag = np.empty(chains * fft_n, dtype=np.float64)
+    scratch = np.empty(2 * chains * fft_n, dtype=np.float64)
+    real = scratch[: chains * fft_n]
+    imag = scratch[chains * fft_n :]
     return float(
         lib().mav_ess(
             addr(array),
-            addr(acov),
             addr(real),
             addr(imag),
             addr(rho),
