@@ -202,6 +202,68 @@ faster fused version is not safe:
   gather per slot, so SIMD lanes cannot help it (8-wide store measured 34.6 vs 35.6 ms at
   best). Rank prepare was already vectorised before this phase.
 
+### GPU phase (2026-11-11): CPU only, no GPU path shipped
+
+The gate in `bench/analysis.md` allows exactly one GPU candidate: the native FFT inside
+`mav_ess` (row 10, 9.38 flops/byte). Every other row is 0.19–2.11 flops/byte and is
+**CPU only: memory-bound** — rank sort 0.42, `mav_rhat` 0.87, batched HDI 0.19, flat HDI
+0.19, split reduction 0.87. No GPU work was done or is proposed for them.
+
+Gate results on this host, in order:
+
+1. Candidate above ~2 flops/byte? Yes, one (`mav_ess` native FFT, 9.38). Everything else
+   is CPU only: memory-bound.
+2. Shared GPU free memory at the start of the phase: **5,884 MiB**
+   (`nvidia-smi --query-gpu=memory.free --format=csv,noheader`), above the 4,000 MiB floor.
+   Largest scratch any experiment below allocated was 4 × 32,768 float64 = 1 MB per buffer.
+3. Device path compiles and runs on the pinned toolchain: yes. `DeviceContext`,
+   `enqueue_create_buffer` / `enqueue_copy` / `enqueue_function` / `synchronize` all work.
+   Two traps beyond `MOJO_NOTES.md` §5, both found by compiling: `grid_dim`/`block_dim` must
+   be `UInt32` and kernel arguments `Int64`, and more than one device buffer in one launch
+   is rejected as aliasing unless each pointer is rebuilt from its address
+   (`Pointer[Float64, AnyOrigin[mut=True]](unsafe_from_address=Int(dev.unsafe_ptr()))`).
+   There is also **no `Float64` `sin`/`cos` on this GPU** (`constraint failed: DType.float64
+   is not supported for sin on NVIDIA GPU`), so twiddles have to be computed on the host.
+
+Measured on this host, with the same runs the verdict rests on:
+
+| measurement | number |
+|---|---:|
+| host→device copy, 8 MB | 0.84 ms (~9 GB/s) |
+| device→host copy, 8 MB | 0.98 ms (~9 GB/s) |
+| 1,048,576-element elementwise kernel (16 MB traffic) | 0.19 ms |
+| empty warm launch (`enqueue_function` return) | 0.006–0.018 ms |
+| batched 4 × 32,768-point FFT prototype, 15 stage launches + 2 copy-ins + 1 copy-out | 1.58–2.30 ms (results incorrect, see below) |
+| CPU `core_ess`, 4 chains × 16,384 draws (the generator's shape) | 2.62–2.76 ms |
+| CPU `core_ess`, 16,384 chains × 4 draws (the same array, transposed) | 1.18–1.61 ms |
+| CPU `core_ess`, 4 chains × 32,768 draws (one row past the native-FFT cutoff) | 12.34 ms |
+
+**Verdict: reverted, nothing shipped.**
+
+- **Reach of the candidate.** The native FFT only runs when `array.size <= 65_536`
+  (`_lib.py:201`), i.e. at most 512 KB of input. Above that the call is the numpy-FFT path,
+  which `analysis.md` rows 3–4 already ruled out for GPU (90.6 of 98.0 ms is `np.fft`).
+- **Floor at the top of that reach.** `fft_n` is the next power of two at or above
+  `2 * draws`, and a batched FFT needs both real and imaginary planes staged, so a GPU
+  version moves at least `3 × 2 × fft_n × chains` float64 between host and device before it
+  computes anything. At the largest reachable point of that shape (16,384 draws × 4 chains,
+  `fft_n = 32,768`) that is 3.1 MB, i.e. ~0.33 ms at the measured 9 GB/s each way, plus 15
+  dependent stage launches (one per FFT stage; a stage cannot be fused with the next without
+  a global barrier). The CPU finishes the same array in 2.62–2.76 ms end to end, and
+  finishes the transposed 16,384 × 4 array — the one `test_ess_simd_tail_and_native_parallel_threshold`
+  exercises — in 1.18–1.61 ms.
+- **What the prototype actually measured.** The batched-stage GPU prototype compiled and ran
+  and its impulse response was correct, but it did not reproduce numpy's FFT for a general
+  signal, and its own timings include states where launches were dropped. Its 1.58–2.30 ms
+  is therefore **not** a GPU timing for correct output, and it is not used as evidence of a
+  win. What it does establish is that no GPU stage sequence ran faster than the ~2 ms CPU
+  it was trying to replace, so nothing was left in the tree to fix the correctness bug
+  against.
+- **Decision.** A GPU path here would add a device dependency for a kernel that, at every
+  size it can legally receive, the CPU already completes in about 1–3 ms. Per the phase
+  rules it was reverted rather than shipped with a size threshold nobody passes. The CPU
+  path is unchanged, the suite still passes without a GPU, and no tests were skipped.
+
 The SIMD tail cases for both kernels are parametrised on the compiled `W`: lengths 0, 1,
 W-1, W, W+1, 2W+3 and 200,003, plus unaligned chain starts (200,001 / 200,002 / 200,003 and
 1,000,001 draws in a 3-chain buffer). The whole suite also passes with
