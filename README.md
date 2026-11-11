@@ -101,6 +101,11 @@ vectorized, and large rank R-hat jobs normalize the bulk and folded arrays concu
 Nearest HDI uses NumPy's optimized sort once and passes that buffer zero-copy to Mojo for
 shortest-window selection.
 
+    report. The R-hat split reduction is scalar rather than SIMD: each chain is summed and
+    squared with eight interleaved float64 accumulators, so the loop no longer waits on the
+    latency of a single dependent add. The interleaving changes the addition order, so R-hat
+    results can differ from a strictly sequential sum in the last bits.
+
 No GPU path is included. The FFT butterfly performs roughly 10 floating-point operations
 while moving at least 32 bytes per stage, below the requested two-flops-per-byte threshold;
 the other kernels are sorting, bandwidth, or branch dominated. Host/device transfers and
@@ -120,18 +125,40 @@ and xarray containers.
 ## Benchmarks
 
 Measured with `pixi run bench`; each result is the best of five warmed runs. A ratio above
-1 means `mojoarviz` is faster.
+1 means `mojoarviz` is faster. "Before" is the same command on the same machine before the
+reduction rewrite below; both sessions were on a shared host, so treat the two-decimal
+figures as comparable to about ±10 %.
 
 Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz; Linux x86_64; Python 3.13.14.
 Versions: mojoarviz 0.1.0; ArViZ 1.2.0; NumPy 2.5.1.
 
-| case | mojoarviz | ArviZ | ArViZ / Mojo | result |
-|---|---:|---:|---:|---|
-| R-hat identity (4 x 1,000,000) | 18.78 ms | 152.62 ms | 8.13x | faster |
-| R-hat rank (4 x 100,000) | 111.18 ms | 171.97 ms | 1.55x | faster |
-| ESS identity AR(1) (4 x 16,384) | 2.90 ms | 5.19 ms | 1.79x | faster |
-| ESS bulk AR(1) (4 x 16,384) | 9.29 ms | 16.00 ms | 1.72x | faster |
-| HDI nearest (1,000,000) | 24.43 ms | 26.31 ms | 1.08x | faster |
+| case | before | after | ArviZ | ArViZ / Mojo | result |
+|---|---:|---:|---:|---:|---|
+| R-hat identity (4 x 1,000,000) | 22.04 ms | 7.35 ms | 41.76 ms | 5.68x | faster |
+| R-hat rank (4 x 100,000) | 113.07 ms | 114.00 ms | 169.33 ms | 1.49x | faster |
+| ESS identity AR(1) (4 x 16,384) | 2.87 ms | 2.70 ms | 5.02 ms | 1.86x | faster |
+| ESS bulk AR(1) (4 x 16,384) | 10.60 ms | 9.72 ms | 15.70 ms | 1.62x | faster |
+| HDI nearest (1,000,000) | 19.29 ms | 19.01 ms | 21.46 ms | 1.13x | faster |
+
+The R-hat identity row is the one this rewrite targets: the `mav_rhat` kernel alone, called
+directly, went from 17.32 ms to 3.52 ms on 4 x 1,000,000 draws (4.9x), and from 1.58 ms to
+0.31 ms on 4 x 100,000. The remaining rows are unchanged within host noise; the rank row
+is dominated by the quicksort, which this phase measured and left alone (see below).
+
+### Summation order
+
+`mav_rhat` now sums each chain with eight interleaved accumulators instead of one running
+sum, and folds `1/(draws-1)` and `1/chains` into one division. Both change the order of
+floating-point additions, so **results can differ from earlier releases, or from ArviZ, in
+the last bits**. Measured against a 128-bit reference at 4 x 1,000,000, 4 x 100,000, 4 x
+16,384, 2 x 7 and 5 x 13 draws, the 8-accumulator sum is within 1e-16 of the exact value,
+the same order of error as the old scalar loop. The parity tolerances are untouched.
+
+Three things were tried and **reverted** because `pixi run bench` did not show them faster:
+bounds-check-free loads/stores in the quicksort (400,000-element sort 49–53 ms either way),
+a two-accumulator Geyer `tau` sum (no change), and bounds-check-free loads in the HDI
+window scan (77 us to 88 us at 1,000,000 values, worse).
+
 
 To reproduce:
 

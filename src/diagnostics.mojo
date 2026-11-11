@@ -273,29 +273,88 @@ def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
             i += 1
 
 
+def chain_sum(values: Ptr, start: Int, count: Int) -> Float64:
+    # Eight independent accumulators: a single running sum serialises on the
+    # float64 add latency, and this loop is the bulk of core_rhat's time.
+    comptime LANES = 8
+    var a0 = 0.0
+    var a1 = 0.0
+    var a2 = 0.0
+    var a3 = 0.0
+    var a4 = 0.0
+    var a5 = 0.0
+    var a6 = 0.0
+    var a7 = 0.0
+    var i = 0
+    while i + LANES <= count:
+        a0 += values.unsafe_load(start + i)
+        a1 += values.unsafe_load(start + i + 1)
+        a2 += values.unsafe_load(start + i + 2)
+        a3 += values.unsafe_load(start + i + 3)
+        a4 += values.unsafe_load(start + i + 4)
+        a5 += values.unsafe_load(start + i + 5)
+        a6 += values.unsafe_load(start + i + 6)
+        a7 += values.unsafe_load(start + i + 7)
+        i += LANES
+    var total = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7)
+    while i < count:
+        total += values.unsafe_load(start + i)
+        i += 1
+    return total
+
+
+def chain_sum_squares(values: Ptr, start: Int, count: Int, center: Float64) -> Float64:
+    comptime LANES = 8
+    var a0 = 0.0
+    var a1 = 0.0
+    var a2 = 0.0
+    var a3 = 0.0
+    var a4 = 0.0
+    var a5 = 0.0
+    var a6 = 0.0
+    var a7 = 0.0
+    var i = 0
+    while i + LANES <= count:
+        var d0 = values.unsafe_load(start + i) - center
+        var d1 = values.unsafe_load(start + i + 1) - center
+        var d2 = values.unsafe_load(start + i + 2) - center
+        var d3 = values.unsafe_load(start + i + 3) - center
+        var d4 = values.unsafe_load(start + i + 4) - center
+        var d5 = values.unsafe_load(start + i + 5) - center
+        var d6 = values.unsafe_load(start + i + 6) - center
+        var d7 = values.unsafe_load(start + i + 7) - center
+        a0 += d0 * d0
+        a1 += d1 * d1
+        a2 += d2 * d2
+        a3 += d3 * d3
+        a4 += d4 * d4
+        a5 += d5 * d5
+        a6 += d6 * d6
+        a7 += d7 * d7
+        i += LANES
+    var total = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7)
+    while i < count:
+        var delta = values.unsafe_load(start + i) - center
+        total += delta * delta
+        i += 1
+    return total
+
+
 def core_rhat(values: Ptr, chains: Int, draws: Int) -> Float64:
+    # Counts are checked by the Python wrapper (chains >= 2, draws >= 2).
     var chain_mean_mean = 0.0
     var within = 0.0
     for chain in range(chains):
-        var mean = 0.0
-        for draw in range(draws):
-            mean += values[chain * draws + draw]
-        mean /= Float64(draws)
+        var start = chain * draws
+        var mean = chain_sum(values, start, draws) / Float64(draws)
         chain_mean_mean += mean
-        var variance = 0.0
-        for draw in range(draws):
-            var delta = values[chain * draws + draw] - mean
-            variance += delta * delta
-        within += variance / Float64(draws - 1)
+        within += chain_sum_squares(values, start, draws, mean) / Float64(draws - 1)
     chain_mean_mean /= Float64(chains)
     within /= Float64(chains)
 
     var between = 0.0
     for chain in range(chains):
-        var mean = 0.0
-        for draw in range(draws):
-            mean += values[chain * draws + draw]
-        mean /= Float64(draws)
+        var mean = chain_sum(values, chain * draws, draws) / Float64(draws)
         var delta = mean - chain_mean_mean
         between += delta * delta
     between *= Float64(draws) / Float64(chains - 1)
