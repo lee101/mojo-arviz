@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import inspect
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -907,3 +913,123 @@ def test_dataset_nan_and_duplicates_match_upstream():
     clean = xr.Dataset({"x": (("chain", "draw"), values[:, 1:])})
     for function in ("ess", "rhat"):
         assert_close(getattr(maz, function)(clean)["x"], getattr(az, function)(clean)["x"], atol=2e-10)
+
+
+# ---------------------------------------------------------------------------
+# SIMD paths: widths 0, 1, W-1, W, W+1 and a large odd length so the scalar tails
+# and the partial trailing blocks are exercised.
+#
+# The rhat kernel and the rank prepare/tie loops are vectorised; both are also
+# reached through the public API. W is read from the compiled kernel by building
+# a two-line shared library, so the tests follow the host instead of assuming 4.
+# MOJOARVIZ_SIMD_WIDTH widens the same cases further (e.g. 8 or 16) to prove the
+# scalar tail at a larger W; the arithmetic is identical, only the block size
+# changes.
+# ---------------------------------------------------------------------------
+
+_WIDTH_SOURCE = """from std.sys.info import simd_width_of
+
+@export("mav_probe_simd_width")
+def mav_probe_simd_width() abi("C") -> Int:
+    return simd_width_of[DType.float64]()
+"""
+
+
+def _probe_simd_width() -> int:
+    override = os.environ.get("MOJOARVIZ_SIMD_WIDTH")
+    if override:
+        return int(override)
+    root = Path(__file__).resolve().parents[1]
+    mojo = os.environ.get("MOJO_BIN") or shutil.which("mojo")
+    if mojo is None:
+        candidate = root / ".pixi" / "envs" / "default" / "bin" / "mojo"
+        mojo = str(candidate) if candidate.exists() else None
+    if mojo is None:
+        return 4
+    env = dict(os.environ)
+    env.setdefault("MODULAR_HOME", str(Path(mojo).resolve().parents[1] / "share" / "max"))
+    with tempfile.TemporaryDirectory() as scratch:
+        source = Path(scratch) / "probe.mojo"
+        source.write_text(_WIDTH_SOURCE)
+        library = Path(scratch) / "probe.so"
+        try:
+            proc = subprocess.run(
+                [mojo, "build", "--emit", "shared-lib", str(source), "-o", str(library)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=300,
+            )
+            if proc.returncode:
+                return 4
+            probe = ctypes.CDLL(str(library))
+            probe.mav_probe_simd_width.restype = ctypes.c_int64
+            return int(probe.mav_probe_simd_width())
+        except (OSError, subprocess.TimeoutExpired, AttributeError):
+            return 4
+
+
+WIDTH = _probe_simd_width()
+SIMD_LENGTHS = [0, 1, WIDTH - 1, WIDTH, WIDTH + 1, 2 * WIDTH + 3, 200_003]
+
+
+@pytest.mark.parametrize("draw_count", SIMD_LENGTHS)
+def test_core_rhat_simd_tails(draw_count):
+    """Both rhat passes, including each scalar tail and an odd row start."""
+    rng = np.random.default_rng(200 + draw_count)
+    chains = 4
+    values = rng.normal(size=(chains, draw_count))
+    # the public entry point: degenerate sizes must agree on "raise" vs "value"
+    ours = _call(maz.rhat, values, method="identity")
+    upstream = _call(az.rhat, values, method="identity")
+    assert ours[0] == upstream[0], (draw_count, ours, upstream)
+    if upstream[0] == "ok":
+        assert_close(ours[1], upstream[1], atol=2e-10)
+    if draw_count < 2:
+        # core_rhat rejects fewer than two draws, like upstream's validity gate
+        return
+    # core_rhat against the closed form, computed in float64 directly
+    chain_means = values.mean(axis=1)
+    within = values.var(axis=1, ddof=1).mean()
+    between = draw_count * chain_means.var(ddof=1)
+    assert_close(core_rhat(values), np.sqrt((between / within + draw_count - 1) / draw_count), atol=1e-12)
+    if draw_count >= 4:
+        assert_close(core_rhat(values), _DiagnosticsBase()._rhat(values), atol=1e-12)
+
+
+@pytest.mark.parametrize("draws", [200_001, 200_002, 200_003])
+def test_core_rhat_unaligned_chain_starts(draws):
+    """Chain rows of 200,001+ draws do not start on a 4-element block."""
+    rng = np.random.default_rng(250 + draws)
+    values = rng.normal(size=(4, draws))
+    assert_close(core_rhat(values), _DiagnosticsBase()._rhat(values), atol=1e-12)
+    # 1,000,001 draws: a row is one draw off a 4-element block, so a 3-chain
+    # buffer shifts each row's start by a different phase.
+    wide = rng.normal(size=(3, 1_000_001))
+    assert_close(core_rhat(wide), _DiagnosticsBase()._rhat(wide), atol=1e-12)
+
+
+@pytest.mark.parametrize("size", SIMD_LENGTHS)
+def test_rank_normalize_simd_tails(size, upstream_base):
+    """Rank prepare, quicksort hand-off and the tie loop at every tail width."""
+    _, diagnostics = upstream_base
+    if size == 0:
+        with pytest.raises(ValueError):
+            rank_normalize(np.empty((1, 0)))
+        return
+    rng = np.random.default_rng(400 + size)
+    distinct = rng.normal(size=size)
+    tied = np.round(rng.normal(size=size), 1)
+    if size >= 3:
+        # one run of ties that starts mid-block and ends at the last value
+        tied[-3:] = tied[0]
+    for case in (distinct, tied):
+        assert_close(rank_normalize(case), diagnostics._z_scale(case), atol=2e-8)
+
+
+def test_rank_normalize_long_tied_runs(upstream_base):
+    """Tie runs longer than a vector: the scatter is scalar, the value is not."""
+    _, diagnostics = upstream_base
+    for size in (WIDTH * 4, 1_003, 200_003):
+        values = np.repeat(np.arange(size // 7 + 1, dtype=np.float64), 7)[:size]
+        assert_close(rank_normalize(values), diagnostics._z_scale(values), atol=2e-8)

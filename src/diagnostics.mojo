@@ -273,88 +273,66 @@ def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
             i += 1
 
 
-def chain_sum(values: Ptr, start: Int, count: Int) -> Float64:
-    # Eight independent accumulators: a single running sum serialises on the
-    # float64 add latency, and this loop is the bulk of core_rhat's time.
-    comptime LANES = 8
-    var a0 = 0.0
-    var a1 = 0.0
-    var a2 = 0.0
-    var a3 = 0.0
-    var a4 = 0.0
-    var a5 = 0.0
-    var a6 = 0.0
-    var a7 = 0.0
+def sum_of_squares(values: Ptr, start: Int, count: Int, center: Float64) -> Float64:
+    # Two independent W-wide accumulators, same pitch as chain_sum_wide.
+    comptime W = simd_width_of[DType.float64]()
+    var c = SIMD[DType.float64, W](center)
+    var a = SIMD[DType.float64, W](0.0)
+    var b = SIMD[DType.float64, W](0.0)
     var i = 0
-    while i + LANES <= count:
-        a0 += values.unsafe_load(start + i)
-        a1 += values.unsafe_load(start + i + 1)
-        a2 += values.unsafe_load(start + i + 2)
-        a3 += values.unsafe_load(start + i + 3)
-        a4 += values.unsafe_load(start + i + 4)
-        a5 += values.unsafe_load(start + i + 5)
-        a6 += values.unsafe_load(start + i + 6)
-        a7 += values.unsafe_load(start + i + 7)
-        i += LANES
-    var total = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7)
+    while i + 2 * W <= count:
+        var d0 = values.unsafe_load[width=W](start + i) - c
+        var d1 = values.unsafe_load[width=W](start + i + W) - c
+        a += d0 * d0
+        b += d1 * d1
+        i += 2 * W
+    var total = (a + b).reduce_add()
     while i < count:
-        total += values.unsafe_load(start + i)
+        var delta = values[start + i] - center
+        total += delta * delta
         i += 1
     return total
 
 
-def chain_sum_squares(values: Ptr, start: Int, count: Int, center: Float64) -> Float64:
-    comptime LANES = 8
-    var a0 = 0.0
-    var a1 = 0.0
-    var a2 = 0.0
-    var a3 = 0.0
-    var a4 = 0.0
-    var a5 = 0.0
-    var a6 = 0.0
-    var a7 = 0.0
+def chain_sum_wide(values: Ptr, start: Int, count: Int) -> Float64:
+    comptime W = simd_width_of[DType.float64]()
+    var a = SIMD[DType.float64, W](0.0)
+    var b = SIMD[DType.float64, W](0.0)
     var i = 0
-    while i + LANES <= count:
-        var d0 = values.unsafe_load(start + i) - center
-        var d1 = values.unsafe_load(start + i + 1) - center
-        var d2 = values.unsafe_load(start + i + 2) - center
-        var d3 = values.unsafe_load(start + i + 3) - center
-        var d4 = values.unsafe_load(start + i + 4) - center
-        var d5 = values.unsafe_load(start + i + 5) - center
-        var d6 = values.unsafe_load(start + i + 6) - center
-        var d7 = values.unsafe_load(start + i + 7) - center
-        a0 += d0 * d0
-        a1 += d1 * d1
-        a2 += d2 * d2
-        a3 += d3 * d3
-        a4 += d4 * d4
-        a5 += d5 * d5
-        a6 += d6 * d6
-        a7 += d7 * d7
-        i += LANES
-    var total = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7)
+    while i + 2 * W <= count:
+        a += values.unsafe_load[width=W](start + i)
+        b += values.unsafe_load[width=W](start + i + W)
+        i += 2 * W
+    var total = (a + b).reduce_add()
     while i < count:
-        var delta = values.unsafe_load(start + i) - center
-        total += delta * delta
+        total += values[start + i]
         i += 1
     return total
 
 
 def core_rhat(values: Ptr, chains: Int, draws: Int) -> Float64:
     # Counts are checked by the Python wrapper (chains >= 2, draws >= 2).
+    #
+    # Same three passes as the reference formula, now SIMD: per chain a sum,
+    # then a sum of squared deviations, then the between-chain term. The
+    # pooled-sum-of-squares shortcut (sum x^2 - n * xbar^2) was measured 2x
+    # faster still, but it loses every last bit of cancellation: a constant
+    # chain, or a chain of 1.0/2.0 draws, produced a negative or absurd
+    # within-chain variance where upstream returns a finite value. Cancellation
+    # safety is part of the contract here, so the fused rewrite was reverted.
     var chain_mean_mean = 0.0
     var within = 0.0
     for chain in range(chains):
         var start = chain * draws
-        var mean = chain_sum(values, start, draws) / Float64(draws)
+        var mean = chain_sum_wide(values, start, draws) / Float64(draws)
         chain_mean_mean += mean
-        within += chain_sum_squares(values, start, draws, mean) / Float64(draws - 1)
+        within += sum_of_squares(values, start, draws, mean) / Float64(draws - 1)
     chain_mean_mean /= Float64(chains)
     within /= Float64(chains)
 
     var between = 0.0
     for chain in range(chains):
-        var mean = chain_sum(values, chain * draws, draws) / Float64(draws)
+        var mean = chain_sum_wide(values, chain * draws, draws) / Float64(draws)
         var delta = mean - chain_mean_mean
         between += delta * delta
     between *= Float64(draws) / Float64(chains - 1)
@@ -386,6 +364,9 @@ def rank_normalize_impl(
         indices[i] = Float64(i)
         i += 1
     quick_sort(sorted_values, indices, dest, n, True)
+    # The tie loop stays scalar: its scatter dest[indices[i]] is a gather, one
+    # per slot, so SIMD lanes cannot help it (a block-filled store measured
+    # 34.6 vs 35.6 ms at 400,000 values, inside the host's noise).
     var first = 0
     while first < n:
         var last = first + 1
