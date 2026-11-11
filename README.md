@@ -34,6 +34,13 @@ Parity tests run against the real `arviz` package from conda-forge. They cover e
 R-hat method listed above, HDI probabilities and axes, tied and autocorrelated draws, odd draw
 counts, single chains, invalid/non-finite inputs, circular samples, and xarray containers.
 
+The suite does not merely check that the port runs: each result is compared with the installed
+ArviZ (or, for the numeric kernels, with `arviz_stats`' own `_z_scale`, `_ess`, `_rhat`, and
+`_hdi_linear_nearest_common`) at a tolerance stated in the test. Degenerate inputs are pinned
+too: zero-size arrays return `NaN` where ArviZ does and raise the same error family where it
+raises, `inf` follows ArviZ's NaN-only validity check, duplicate draws match ArviZ's tie
+handling, and DataArray/Dataset results keep upstream's dims, coordinates, names, and attrs.
+
 ## Install
 
 Install [Pixi](https://pixi.sh/), then create the pinned environment and build the shared

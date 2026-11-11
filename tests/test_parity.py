@@ -336,3 +336,574 @@ def test_dataset_hdi(draws):
     assert set(ours.data_vars) == set(theirs.data_vars)
     for name in ours:
         assert_close(ours[name], theirs[name], atol=0)
+
+
+# ---------------------------------------------------------------------------
+# Parity of the FFI-level kernels against the very same internals ArviZ uses.
+# ---------------------------------------------------------------------------
+
+from arviz_stats.base.core import _CoreBase  # noqa: E402
+from arviz_stats.base.diagnostics import _DiagnosticsBase  # noqa: E402
+
+from mojoarviz._lib import rank_normalize, rank_normalize_pair  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def upstream_base():
+    return _CoreBase(), _DiagnosticsBase()
+
+
+def test_rank_normalization_matches_upstream_z_scale(upstream_base):
+    _, diagnostics = upstream_base
+    rng = np.random.default_rng(101)
+    cases = [
+        rng.normal(size=(1, 50)),
+        np.round(rng.normal(size=(4, 13)), 1),  # ties
+        np.round(rng.normal(size=(3, 7, 2)), 1),  # batch + ties
+        np.ones((2, 6)),  # all equal
+    ]
+    for values in cases:
+        # upstream: _DiagnosticsBase._z_scale (rankdata + Blom back-transform)
+        # atol covers Mojo's Acklam ppf vs scipy.stats.norm.ppf (observed max ~3e-9).
+        assert_close(rank_normalize(values), diagnostics._z_scale(values), atol=2e-8)
+
+
+def test_rank_normalization_ignores_nan_like_upstream(upstream_base):
+    _, diagnostics = upstream_base
+    rng = np.random.default_rng(102)
+    values = rng.normal(size=(2, 60))
+    values.ravel()[::7] = np.nan
+    # atol covers Mojo's Acklam ppf vs scipy.stats.norm.ppf (observed max ~3e-9).
+    assert_close(rank_normalize(values), diagnostics._z_scale(values), atol=2e-8)
+    assert np.isnan(rank_normalize(values)).sum() == np.isnan(values).sum()
+
+
+def test_rank_pair_matches_upstream_fold_and_z_scale(upstream_base):
+    _, diagnostics = upstream_base
+    split = np.round(np.random.default_rng(103).normal(size=(6, 21)), 1)
+    folded = np.abs(split - np.median(split))
+    bulk, tail = rank_normalize_pair(split, folded)
+    assert_close(bulk, diagnostics._z_scale(split), atol=2e-8)
+    assert_close(tail, diagnostics._z_scale(folded), atol=2e-8)
+
+
+def test_core_kernels_match_upstream(upstream_base):
+    core, diagnostics = upstream_base
+    rng = np.random.default_rng(104)
+    values = rng.normal(size=(4, 101))
+    assert_close(core_ess(values), diagnostics._ess(values), atol=1e-9)
+    assert_close(core_ess(values, True), diagnostics._ess(values, relative=True), atol=1e-9)
+    assert_close(core_rhat(values), diagnostics._rhat(values), atol=1e-12)
+    # constant input short-circuits to the sample count upstream.
+    assert core_ess(np.ones((3, 9))) == diagnostics._ess(np.ones((3, 9))) == 27
+
+
+def test_hdi_kernel_matches_upstream(upstream_base):
+    core, _ = upstream_base
+    rng = np.random.default_rng(105)
+    values = rng.normal(size=(4, 101))
+    flat = values.ravel()
+    for prob in (0.3, 0.5, 0.89):
+        interval_idx = int(np.floor(prob * flat.size))
+        # upstream: _CoreBase._hdi_linear_nearest_common
+        assert_close(
+            hdi_nearest(values, interval_idx),
+            core._hdi_linear_nearest_common(flat, prob),
+            atol=0,
+        )
+    # ties: the first minimal window wins in both implementations.
+    ties = np.array([1.0, 1.0, 1.0, 2.0, 3.0])
+    for prob in (0.4, 0.6, 0.89):
+        assert_close(
+            hdi_nearest(ties, int(np.floor(prob * ties.size)), ravel=False),
+            core._hdi_linear_nearest_common(ties, prob),
+            atol=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Degenerate inputs: empty, one element, duplicates, non-finite, bad shapes.
+#
+# Every expectation below is taken from the installed ArviZ 1.2.0
+# (arviz_stats 1.2.0) by calling it in the same test. Where upstream raises, the
+# port must raise an exception of the same family; where upstream returns a
+# value, the port must return that value within the stated tolerance.
+# ---------------------------------------------------------------------------
+
+
+def _call(function, *args, **kwargs):
+    """Return ``("ok", value, None)`` or ``("error", None, exception_class)``."""
+    try:
+        return "ok", function(*args, **kwargs), None
+    except Exception as err:  # noqa: BLE001 - parity is about the exception class
+        return "error", None, type(err)
+
+
+def _assert_same_error(ours, upstream):
+    assert ours[0] == "error", ("port returned a value", ours)
+    assert upstream[0] == "error", ("upstream returned a value", upstream)
+    # numpy's AxisError subclasses ValueError, so this accepts upstream's
+    # "axes don't match array" against the port's AxisError for 1-D input.
+    assert issubclass(ours[2], (ValueError, KeyError)), ours[2]
+    assert issubclass(upstream[2], (ValueError, KeyError)), upstream[2]
+
+
+@pytest.mark.parametrize("shape", [(0,), (0, 0), (0, 4), (4, 0), (0, 0, 2), (3, 0, 2)])
+@pytest.mark.parametrize("function", ["ess", "rhat"])
+def test_empty_input_matches_upstream(shape, function):
+    empty = np.empty(shape)
+    ours = _call(getattr(maz, function), empty)
+    upstream = _call(getattr(az, function), empty)
+    if upstream[0] == "error":
+        _assert_same_error(ours, upstream)
+        return
+    assert ours[0] == "ok", (shape, function, ours)
+    assert np.shape(ours[1]) == np.shape(upstream[1])
+    assert_close(ours[1], upstream[1], atol=0)
+
+
+@pytest.mark.parametrize("method", ["bulk", "mean", "tail", "quantile", "local", "mad", "folded"])
+def test_empty_input_matches_upstream_for_each_method(method):
+    kwargs = {"tail": {"prob": 0.1}, "quantile": {"prob": 0.3}, "local": {"prob": (0.2, 0.8)}}
+    empty = np.empty((0, 4))
+    ours = _call(maz.ess, empty, method=method, **kwargs.get(method, {}))
+    upstream = _call(az.ess, empty, method=method, **kwargs.get(method, {}))
+    assert ours[0] == upstream[0] == "ok", (method, ours, upstream)
+    # upstream: stats_utils._ufunc indexes the zero-size core result, giving NaN.
+    assert np.isnan(ours[1]) and np.isnan(upstream[1])
+
+
+def test_empty_hdi_matches_upstream():
+    for values in (np.array([]), np.empty((2, 0))):
+        ours = _call(maz.hdi, values)
+        upstream = _call(az.hdi, values)
+        _assert_same_error(ours, upstream)
+        assert issubclass(upstream[2], ValueError)
+
+
+def test_one_element_and_single_draw_match_upstream():
+    rng = np.random.default_rng(106)
+    for values in (np.array([1.0]), np.array([[1.0]]), rng.normal(size=(2, 1)), rng.normal(size=(1, 1))):
+        for function in ("ess", "rhat"):
+            ours = _call(getattr(maz, function), values)
+            upstream = _call(getattr(az, function), values)
+            assert ours[0] == upstream[0], (values.shape, function, ours, upstream)
+            if upstream[0] == "ok":
+                assert_close(ours[1], upstream[1], atol=0)
+
+
+@pytest.mark.parametrize("draw_count", [1, 2, 3])
+def test_too_few_draws_match_upstream(draw_count):
+    values = np.random.default_rng(107).normal(size=(3, draw_count))
+    for method in ("bulk", "identity", "median", "mad"):
+        assert np.isnan(maz.ess(values, method=method))
+        assert np.isnan(az.ess(values, method=method))
+    for method in ("rank", "identity", "split", "folded", "z_scale"):
+        assert np.isnan(maz.rhat(values, method=method))
+        assert np.isnan(az.rhat(values, method=method))
+
+
+def test_single_chain_matches_upstream():
+    values = np.random.default_rng(108).normal(size=(1, 40))
+    assert_close(maz.ess(values), az.ess(values), atol=1e-9)
+    assert_close(maz.ess(values, method="identity"), az.ess(values, method="identity"), atol=1e-9)
+    assert np.isnan(maz.rhat(values)) and np.isnan(az.rhat(values))
+
+
+def test_duplicate_values_match_upstream():
+    values = np.array([[1.0, 1.0, 1.0, 1.0, 2.0, 2.0], [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]])
+    for method in ("bulk", "identity", "mean", "sd", "median", "mad", "z_scale", "folded"):
+        assert_close(maz.ess(values, method=method), az.ess(values, method=method), atol=1e-13)
+    for method in ("rank", "identity", "split", "folded", "z_scale"):
+        assert_close(maz.rhat(values, method=method), az.rhat(values, method=method), atol=1e-13)
+
+
+def test_duplicate_values_hdi_match_upstream():
+    values = np.array([1.0, 1.0, 1.0, 2.0, 2.0])
+    for prob in (0.4, 0.6, 0.89, 1.0):
+        ours = _call(maz.hdi, values, prob=prob)
+        upstream = _call(az.hdi, values, prob=prob)
+        if upstream[0] == "error":
+            _assert_same_error(ours, upstream)
+            continue
+        assert ours[0] == "ok", (prob, ours)
+        assert_close(ours[1], upstream[1], atol=0)
+
+
+def test_nan_inputs_match_upstream():
+    values = np.arange(80.0).reshape(4, 20)
+    values.ravel()[::9] = np.nan
+    kwargs_for = {"tail": {"prob": 0.1}, "quantile": {"prob": 0.3}, "local": {"prob": (0.2, 0.8)}}
+    for method in ("bulk", "identity", "mean", "sd", "median", "mad", "z_scale", "folded",
+                   "tail", "quantile", "local"):
+        kw = kwargs_for.get(method, {})
+        assert np.isnan(maz.ess(values, method=method, **kw))
+        assert np.isnan(az.ess(values, method=method, **kw))
+    for method in ("rank", "identity", "split", "folded", "z_scale"):
+        assert np.isnan(maz.rhat(values, method=method))
+        assert np.isnan(az.rhat(values, method=method))
+
+
+def test_all_nan_matches_upstream():
+    values = np.full((4, 20), np.nan)
+    assert np.isnan(maz.ess(values)) and np.isnan(az.ess(values))
+    assert np.isnan(maz.rhat(values)) and np.isnan(az.rhat(values))
+
+
+@pytest.mark.parametrize("position", [(0, 0), (1, 5), (3, 29)])
+def test_infinite_draws_match_upstream(position):
+    """Upstream's not_valid() rejects NaN but not inf, so rank-based methods stay finite."""
+    values = np.random.default_rng(109).normal(size=(4, 30))
+    values[position] = np.inf
+    kwargs_for = {"tail": {"prob": 0.1}, "quantile": {"prob": 0.3}, "local": {"prob": (0.2, 0.8)}}
+    for method in ("bulk", "mean", "mad", "folded", "z_scale", "median", "tail", "quantile", "local"):
+        kw = kwargs_for.get(method, {})
+        assert_close(
+            maz.ess(values, method=method, **kw),
+            az.ess(values, method=method, **kw),
+            atol=1e-7,
+        )
+    for method in ("identity", "sd"):
+        assert np.isnan(maz.ess(values, method=method))
+        assert np.isnan(az.ess(values, method=method))
+    for method in ("rank", "folded", "z_scale"):
+        assert_close(maz.rhat(values, method=method), az.rhat(values, method=method), atol=2e-10)
+    for method in ("identity", "split"):
+        assert np.isnan(maz.rhat(values, method=method))
+        assert np.isnan(az.rhat(values, method=method))
+
+
+def test_infinite_left_tail_matches_upstream():
+    values = np.random.default_rng(110).normal(size=(4, 30))
+    values[2, 9] = -np.inf
+    assert_close(maz.ess(values), az.ess(values), atol=1e-7)
+    assert_close(maz.rhat(values), az.rhat(values), atol=2e-10)
+    assert np.isnan(maz.ess(values, method="identity"))
+    assert np.isnan(az.ess(values, method="identity"))
+
+
+def test_mismatched_axes_match_upstream():
+    values = np.random.default_rng(111).normal(size=(2, 10))
+    for kwargs in (
+        {"chain_axis": 1, "draw_axis": 1},
+        {"chain_axis": 0, "draw_axis": 0},
+        {"chain_axis": 5, "draw_axis": 1},
+        {"chain_axis": 0, "draw_axis": -3},
+    ):
+        for function in ("ess", "rhat"):
+            ours = _call(getattr(maz, function), values, **kwargs)
+            upstream = _call(getattr(az, function), values, **kwargs)
+            _assert_same_error(ours, upstream)
+
+
+def test_1d_input_without_chain_axis_matches_upstream_error():
+    values = np.random.default_rng(112).normal(size=20)
+    ours = _call(maz.ess, values)
+    upstream = _call(az.ess, values)
+    # upstream raises ValueError("axes don't match array"); the port raises numpy's
+    # AxisError, which is a ValueError subclass.
+    _assert_same_error(ours, upstream)
+    assert issubclass(ours[2], ValueError)
+    assert_close(
+        maz.ess(values, chain_axis=None, draw_axis=-1),
+        az.ess(values, chain_axis=None, draw_axis=-1),
+        atol=1e-9,
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([2.5]),
+        np.array([2.0, 2.0]),
+        np.array([]),
+        np.empty((2, 0)),
+        np.array([0.0, np.nan, 2.0, np.nan]),
+        np.array([0.0, np.inf, 2.0, 3.0]),
+        np.arange(12.0).reshape(3, 4),
+    ],
+)
+@pytest.mark.parametrize("prob", [0.5, 0.89, 1.0])
+def test_hdi_degenerate_inputs_match_upstream(values, prob):
+    ours = _call(maz.hdi, values, prob=prob)
+    upstream = _call(az.hdi, values, prob=prob)
+    if upstream[0] == "error":
+        _assert_same_error(ours, upstream)
+        return
+    assert ours[0] == "ok", (values.shape, prob, ours)
+    assert np.shape(ours[1]) == np.shape(upstream[1])
+    assert_close(ours[1], upstream[1], atol=0)
+
+
+@pytest.mark.parametrize("dtype", [np.int64, np.int32, bool])
+def test_hdi_integer_and_bool_inputs_match_upstream(dtype):
+    rng = np.random.default_rng(113)
+    if dtype is bool:
+        values = rng.integers(0, 2, size=101).astype(bool)
+    else:
+        values = rng.integers(-3, 4, size=101).astype(dtype)
+    assert_close(maz.hdi(values, prob=0.6), az.hdi(values, prob=0.6), atol=0)
+
+
+def test_hdi_nan_column_pattern_matches_upstream():
+    values = np.random.default_rng(114).normal(size=(10, 3))
+    values[:, 1] = np.nan
+    for skipna in (False, True):
+        assert_close(
+            maz.hdi(values, prob=0.5, skipna=skipna),
+            az.hdi(values, prob=0.5, skipna=skipna),
+            atol=0,
+        )
+
+
+def test_hdi_circular_duplicates_and_one_element_match_upstream():
+    rng = np.random.default_rng(115)
+    for values in (
+        np.array([0.0, 0.0, 0.0, 1.0]),
+        np.array([-np.pi + 0.01, np.pi - 0.01, 0.0]),
+        np.array([1.25]),
+        rng.uniform(-np.pi, np.pi, size=101),
+    ):
+        for prob in (0.5, 0.89):
+            assert_close(
+                maz.hdi(values, prob=prob, circular=True),
+                az.hdi(values, prob=prob, circular=True),
+                atol=1e-12,
+            )
+
+
+def test_hdi_axis_duplicates_and_kwargs_errors_match_upstream():
+    values = np.random.default_rng(116).normal(size=(4, 11))
+    ours = _call(maz.hdi, values, axis=(0, 0))
+    upstream = _call(az.hdi, values, axis=(0, 0))
+    if upstream[0] == "error":
+        _assert_same_error(ours, upstream)
+    else:
+        assert ours[0] == "ok"
+        assert_close(ours[1], upstream[1], atol=0)
+
+    for kwargs in ({"foo": 1}, {"foo": 1, "bar": 2}):
+        ours = _call(maz.hdi, values, **kwargs)
+        upstream = _call(az.hdi, values, **kwargs)
+        assert ours[0] == upstream[0] == "error", (kwargs, ours, upstream)
+        assert ours[2] is upstream[2] is TypeError, (kwargs, ours[2], upstream[2])
+
+    for prob in (0.0, 1.5, -0.1):
+        ours = _call(maz.hdi, values, prob=prob)
+        upstream = _call(az.hdi, values, prob=prob)
+        assert ours[0] == upstream[0] == "error", (prob, ours, upstream)
+        assert ours[2] is upstream[2] is ValueError, (prob, ours[2], upstream[2])
+
+
+def test_hdi_default_probability_matches_upstream():
+    values = np.random.default_rng(117).normal(size=200)
+    assert_close(maz.hdi(values), az.hdi(values), atol=0)
+
+
+def test_tail_and_quantile_probability_forms_match_upstream():
+    values = np.random.default_rng(118).normal(size=(4, 60))
+    for prob in (0.1, 0.5, 0.9, 1, [0.1, 0.9], (0.9, 0.1)):
+        assert_close(
+            maz.ess(values, method="tail", prob=prob),
+            az.ess(values, method="tail", prob=prob),
+            atol=1e-9,
+        )
+    for prob in (0.0, 0.5, 1.0):
+        assert_close(
+            maz.ess(values, method="quantile", prob=prob),
+            az.ess(values, method="quantile", prob=prob),
+            atol=1e-9,
+        )
+
+
+def test_missing_and_invalid_probability_errors_match_upstream():
+    values = np.random.default_rng(119).normal(size=(4, 20))
+    for method in ("tail", "quantile", "local"):
+        ours = _call(maz.ess, values, method=method)
+        upstream = _call(az.ess, values, method=method)
+        assert ours[0] == upstream[0] == "error", (method, ours, upstream)
+        assert ours[2] is upstream[2] is TypeError, (method, ours[2], upstream[2])
+    for prob in ((0.5,), (0.1, 0.5, 0.9)):
+        ours = _call(maz.ess, values, method="local", prob=prob)
+        upstream = _call(az.ess, values, method="local", prob=prob)
+        assert ours[0] == upstream[0] == "error", (prob, ours, upstream)
+        assert ours[2] is upstream[2] is ValueError, (prob, ours[2], upstream[2])
+
+
+def test_invalid_method_errors_match_upstream():
+    values = np.random.default_rng(120).normal(size=(4, 20))
+    for function in ("ess", "rhat"):
+        ours = _call(getattr(maz, function), values, method="unknown")
+        upstream = _call(getattr(az, function), values, method="unknown")
+        assert ours[0] == upstream[0] == "error", (function, ours, upstream)
+        assert ours[2] is upstream[2] is ValueError, (function, ours[2], upstream[2])
+
+
+# ---------------------------------------------------------------------------
+# xarray containers: attrs, coordinates, variable selection, dim rules.
+# ---------------------------------------------------------------------------
+
+
+def test_dataarray_attrs_and_coords_match_upstream():
+    values = np.random.default_rng(121).normal(size=(4, 30, 3))
+    array = xr.DataArray(
+        values,
+        dims=("chain", "draw", "p"),
+        coords={"p": ["a", "b", "c"]},
+        name="theta",
+        attrs={"units": "m"},
+    )
+    for function in ("ess", "rhat"):
+        ours = getattr(maz, function)(array)
+        theirs = getattr(az, function)(array)
+        assert ours.dims == theirs.dims
+        assert ours.name == theirs.name
+        assert ours.attrs == theirs.attrs
+        for dim in theirs.dims:
+            np.testing.assert_array_equal(np.asarray(ours.coords[dim]), np.asarray(theirs.coords[dim]))
+        assert_close(ours, theirs, atol=2e-10)
+
+    ours_hdi = maz.hdi(array, prob=0.6)
+    theirs_hdi = az.hdi(array, prob=0.6)
+    assert ours_hdi.dims == theirs_hdi.dims
+    assert ours_hdi.name == theirs_hdi.name
+    assert ours_hdi.attrs == theirs_hdi.attrs
+    assert ours_hdi.ci_bound.attrs == theirs_hdi.ci_bound.attrs
+    assert list(ours_hdi.ci_bound.values) == list(theirs_hdi.ci_bound.values)
+    assert_close(ours_hdi, theirs_hdi, atol=0)
+
+
+@pytest.mark.parametrize("dim", [None, "draw", ["chain", "draw"]])
+def test_dataarray_hdi_dim_selection_matches_upstream(dim):
+    values = np.random.default_rng(122).normal(size=(4, 21, 2))
+    array = xr.DataArray(values, dims=("chain", "draw", "p"))
+    ours = maz.hdi(array, prob=0.7, dim=dim)
+    theirs = az.hdi(array, prob=0.7, dim=dim)
+    assert ours.dims == theirs.dims
+    assert_close(ours, theirs, atol=0)
+
+
+@pytest.mark.parametrize("sample_dims", [["chain", "draw", "p"]])
+def test_dataarray_bad_sample_dims_match_upstream(sample_dims):
+    values = np.random.default_rng(123).normal(size=(4, 30, 2))
+    array = xr.DataArray(values, dims=("chain", "draw", "p"))
+    for function in ("ess", "rhat"):
+        ours = _call(getattr(maz, function), array, sample_dims=sample_dims)
+        upstream = _call(getattr(az, function), array, sample_dims=sample_dims)
+        assert ours[0] == upstream[0] == "error", (sample_dims, function, ours, upstream)
+        assert ours[2] is upstream[2] is ValueError, (sample_dims, function, ours[2], upstream[2])
+
+
+def test_dataarray_single_dim_rhat_rejected_like_upstream():
+    """upstream: arviz_stats.base.dataarray _DataArrayStats.rhat requires len(dims) == 2."""
+    values = np.random.default_rng(127).normal(size=(4, 30, 2))
+    array = xr.DataArray(values, dims=("chain", "draw", "p"))
+    ours = _call(maz.rhat, array, sample_dims=["draw"])
+    upstream = _call(az.rhat, array, sample_dims=["draw"])
+    assert ours[0] == upstream[0] == "error", (ours, upstream)
+    assert ours[2] is upstream[2] is ValueError, (ours[2], upstream[2])
+
+    # ess accepts a single sample dim on both sides.
+    assert_close(maz.ess(array, sample_dims=["draw"]), az.ess(array, sample_dims=["draw"]), atol=1e-9)
+
+
+def test_dataset_variable_selection_matches_upstream():
+    def fresh():
+        rng = np.random.default_rng(124)
+        return xr.Dataset(
+            {
+                "theta": (("chain", "draw"), rng.normal(size=(4, 30)), {"units": "m"}),
+                "theta_aux": (("chain", "draw"), rng.normal(size=(4, 30))),
+                "mu": (("chain", "draw"), rng.normal(size=(4, 30))),
+            }
+        )
+
+    selections = [
+        {"var_names": ["mu", "theta"]},
+        {"var_names": ["theta"], "filter_vars": "like"},
+        {"var_names": ["^theta"], "filter_vars": "regex"},
+        {"var_names": ["~theta"]},
+        {"var_names": ["~theta"], "filter_vars": "regex"},
+        {"var_names": ["~does_not_exist"]},
+        {"var_names": "mu"},
+        {"var_names": ["missing"]},
+    ]
+    for selection in selections:
+        ours = _call(maz.ess, fresh(), **selection)
+        upstream = _call(az.ess, fresh(), **selection)
+        if upstream[0] == "error":
+            _assert_same_error(ours, upstream)
+            continue
+        assert ours[0] == "ok", (selection, ours)
+        assert list(ours[1].data_vars) == list(upstream[1].data_vars), selection
+        for name in upstream[1]:
+            assert_close(ours[1][name], upstream[1][name], atol=1e-9)
+
+
+def test_dataset_negation_with_like_or_regex_matches_upstream():
+    """upstream: arviz_base.utils._subset_list applies "~name" exclusions, then filters.
+
+    ArviZ itself raises TypeError when the excluded name exists *and* a like/regex
+    filter is combined with it, so that narrower form is not pinned here.
+    """
+
+    def fresh():
+        rng = np.random.default_rng(128)
+        return xr.Dataset(
+            {
+                "theta": (("chain", "draw"), rng.normal(size=(4, 30))),
+                "theta_aux": (("chain", "draw"), rng.normal(size=(4, 30))),
+                "mu": (("chain", "draw"), rng.normal(size=(4, 30))),
+            }
+        )
+
+    # Values recorded from az.ess(...) on the same fixture.
+    ours = maz.ess(fresh(), var_names=["~theta_aux"], filter_vars="like")
+    assert list(ours.data_vars) == ["theta", "mu"]
+    ours = maz.ess(fresh(), var_names=["~theta"], filter_vars="regex")
+    assert list(ours.data_vars) == ["mu"]
+    theirs = az.ess(fresh(), var_names=["~theta"], filter_vars="regex")
+    assert list(theirs.data_vars) == ["mu"]
+    for name in ours.data_vars:
+        assert_close(ours[name], az.ess(fresh(), var_names=["~theta"], filter_vars="regex")[name], atol=1e-9)
+
+
+def test_dataset_unsupported_filter_vars_matches_upstream():
+    rng = np.random.default_rng(129)
+    dataset = xr.Dataset({"mu": (("chain", "draw"), rng.normal(size=(4, 30)))})
+    ours = _call(maz.ess, dataset, var_names=["mu"], filter_vars="bogus")
+    upstream = _call(az.ess, dataset, var_names=["mu"], filter_vars="bogus")
+    assert ours[0] == upstream[0] == "error", (ours, upstream)
+    assert ours[2] is upstream[2] is ValueError, (ours[2], upstream[2])
+
+
+def test_dataset_group_and_attrs_match_upstream():
+    rng = np.random.default_rng(125)
+    dataset = xr.Dataset(
+        {
+            "theta": (("chain", "draw"), rng.normal(size=(4, 30)), {"units": "m"}),
+            "mu": (("chain", "draw"), rng.normal(size=(4, 30))),
+        }
+    )
+    ours, theirs = maz.ess(dataset), az.ess(dataset)
+    assert list(ours.data_vars) == list(theirs.data_vars)
+    for name in theirs:
+        assert_close(ours[name], theirs[name], atol=1e-9)
+        assert ours[name].attrs == theirs[name].attrs
+
+    ours_prior = _call(maz.ess, dataset, group="prior")
+    theirs_prior = _call(az.ess, dataset, group="prior")
+    assert ours_prior[0] == theirs_prior[0] == "ok"
+    assert_close(ours_prior[1]["theta"], theirs_prior[1]["theta"], atol=1e-9)
+
+
+def test_dataset_nan_and_duplicates_match_upstream():
+    rng = np.random.default_rng(126)
+    values = np.round(rng.normal(size=(3, 40)), 0)
+    values[0, 2] = np.nan
+    dataset = xr.Dataset({"x": (("chain", "draw"), values)})
+    assert np.isnan(maz.ess(dataset)["x"])
+    assert np.isnan(az.ess(dataset)["x"])
+    clean = xr.Dataset({"x": (("chain", "draw"), values[:, 1:])})
+    for function in ("ess", "rhat"):
+        assert_close(getattr(maz, function)(clean)["x"], getattr(az, function)(clean)["x"], atol=2e-10)

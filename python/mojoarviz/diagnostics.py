@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 
 import numpy as np
@@ -50,7 +49,9 @@ def _split_chains(values):
 
 
 def _valid(values, min_chains):
-    return values.shape[0] >= min_chains and values.shape[1] >= 4 and np.isfinite(values).all()
+    # arviz_stats.base.stats_utils.not_valid: only NaN is rejected, so inf inputs
+    # still produce finite diagnostics (e.g. after the rank transform).
+    return values.shape[0] >= min_chains and values.shape[1] >= 4 and not np.isnan(values).any()
 
 
 def _ess_one(values, method, relative, prob):
@@ -121,6 +122,10 @@ def _rhat_one(values, method):
 def _map_samples(data, fn, chain_axis, draw_axis):
     array = _sample_array(data, chain_axis, draw_axis)
     batch_shape = array.shape[:-2]
+    if 0 in array.shape:
+        # arviz_stats.base.stats_utils.make_ufunc maps a zero-size core to NaN in the
+        # output shape instead of failing to reshape the batch (e.g. az.ess(np.empty((0, 4)))).
+        return np.full(batch_shape, np.nan, dtype=np.float64)
     batch = array.reshape((-1,) + array.shape[-2:])
     result = np.empty(batch.shape[0], dtype=np.float64)
     for index, values in enumerate(batch):
@@ -129,16 +134,27 @@ def _map_samples(data, fn, chain_axis, draw_axis):
 
 
 def _select_vars(dataset, var_names, filter_vars):
+    # Delegates to arviz_base.utils._subset_list, the helper every ArviZ selection
+    # path uses: "~name" excludes, "like"/"regex" form a union in dataset order,
+    # and names that are not present raise KeyError.
+    if filter_vars not in {None, "like", "regex"}:
+        raise ValueError(f"'filter_vars' can only be None, 'like', or 'regex', got: '{filter_vars}'")
     if var_names is None:
         return list(dataset.data_vars)
-    names = [var_names] if isinstance(var_names, str) else list(var_names)
-    if filter_vars is None:
+    try:
+        from arviz_base.utils import _subset_list
+    except ImportError:  # pragma: no cover - arviz_base ships with arviz 1.2
+        names = [var_names] if isinstance(var_names, str) else list(var_names)
+        missing = [name for name in names if name not in dataset.data_vars]
+        if missing:
+            raise KeyError(f"{np.asarray(missing)} are not present") from None
         return names
-    if filter_vars == "like":
-        return [name for name in dataset.data_vars if any(term in name for term in names)]
-    if filter_vars == "regex":
-        return [name for name in dataset.data_vars if any(re.search(term, name) for term in names)]
-    raise ValueError("filter_vars must be one of None, 'like', or 'regex'")
+    try:
+        return _subset_list(
+            var_names, list(dataset.data_vars), filter_items=filter_vars, warn=False
+        )
+    except KeyError as err:
+        raise KeyError(f"var names: {err} in dataset") from err
 
 
 def _container_group(data, group):
@@ -169,7 +185,9 @@ def _sample_dims(data_array, sample_dims):
     return sample_dims
 
 
-def _apply_xarray_diagnostic(data, function, sample_dims, group, var_names, filter_vars, coords):
+def _apply_xarray_diagnostic(
+    data, function, sample_dims, group, var_names, filter_vars, coords, require_two_dims=False
+):
     container, xr = _container_group(data, group)
     if container is None:
         return None
@@ -180,13 +198,23 @@ def _apply_xarray_diagnostic(data, function, sample_dims, group, var_names, filt
         dims = _sample_dims(array, sample_dims)
         if len(dims) > 2:
             raise ValueError("sample_dims can only have 1 or 2 elements")
+        if require_two_dims and len(dims) != 2:
+            # arviz_stats.base.dataarray._DataArrayStats.rhat
+            raise ValueError("dims must be of length 2 for rhat computation")
         remaining = [dim for dim in array.dims if dim not in dims]
         ordered = array.transpose(*(remaining + dims))
         chain_axis = -2 if len(dims) == 2 else None
         draw_axis = -1
         values = function(ordered.values, chain_axis, draw_axis)
         coords_out = {dim: ordered.coords[dim] for dim in remaining}
-        return xr.DataArray(values, dims=remaining, coords=coords_out, name=array.name)
+        # arviz_stats applies to the DataArray in place, keeping its attrs.
+        return xr.DataArray(
+            values,
+            dims=remaining,
+            coords=coords_out,
+            name=array.name,
+            attrs=array.attrs,
+        )
 
     if isinstance(container, xr.DataArray):
         return apply_one(container)
@@ -256,6 +284,7 @@ def rhat(
             var_names,
             filter_vars,
             coords,
+            require_two_dims=True,
         )
         if result is not None:
             return result
@@ -286,7 +315,9 @@ def _hdi_one(values, prob, circular, skipna):
         mean = np.angle(np.mean(np.exp(1j * values)))
         values = _standardize_angle(values - mean)
     interval_idx = int(np.floor(prob * len(values)))
-    if interval_idx >= len(values):
+    if interval_idx > len(values) - 1:
+        # arviz_stats.base.core._hdi_linear_nearest_common: only an empty interval
+        # window is an error; a one-element window (prob == 1) is still valid.
         raise ValueError("Too few elements for interval calculation. ")
     if np.isnan(values).any():
         interval = _hdi_python(values, prob)
@@ -308,6 +339,9 @@ def _hdi_array(data, prob, axis, circular, skipna):
     moved = np.transpose(array, remaining + axes)
     reduce_size = int(np.prod([array.shape[axis] for axis in axes], dtype=np.int64))
     batch_shape = moved.shape[: len(remaining)]
+    if 0 in moved.shape:
+        # arviz_stats.base.core._hdi_linear_nearest_common raises for a zero-size core.
+        raise ValueError("Too few elements for interval calculation. ")
     batch = moved.reshape((-1, reduce_size))
     result = np.empty((batch.shape[0], 2), dtype=np.float64)
     for index, values in enumerate(batch):
@@ -356,12 +390,17 @@ def hdi(
         axes = tuple(range(-len(dims), 0))
         values = _hdi_array(ordered.values, prob, axes, circular, skipna)
         coords_out = {name: ordered.coords[name] for name in remaining}
-        coords_out["ci_bound"] = ["lower", "upper"]
+        coords_out["ci_bound"] = xr.DataArray(
+            ["lower", "upper"],
+            dims=["ci_bound"],
+            attrs={"ci_kind": "hdi", "ci_prob": prob},
+        )
         return xr.DataArray(
             values,
             dims=remaining + ["ci_bound"],
             coords=coords_out,
             name=array.name,
+            attrs=array.attrs,
         )
 
     if isinstance(container, xr.DataArray):

@@ -308,8 +308,12 @@ def rank_normalize_impl(
     indices: Ptr,
     dest: Ptr,
     n: Int,
+    total: Int = -1,
 ):
+    # Matches arviz_stats.base.diagnostics._DiagnosticsBase._backtransform_ranks:
+    # ranks are scaled by the full array size even when NaN entries are omitted.
     comptime W = simd_width_of[DType.float64]()
+    var size = n if total < 0 else total
     var i = 0
     while i + W <= n:
         sorted_values.store(i, source.unsafe_load[width=W](i))
@@ -329,7 +333,7 @@ def rank_normalize_impl(
         while last < n and sorted_values[last] == sorted_values[first]:
             last += 1
         var average_rank = (Float64(first + 1) + Float64(last)) / 2.0
-        var probability = (average_rank - 0.375) / (Float64(n) + 0.25)
+        var probability = (average_rank - 0.375) / (Float64(size) + 0.25)
         var z = normal_ppf(probability)
         for i in range(first, last):
             dest[Int(indices[i])] = z
@@ -343,6 +347,7 @@ def mav_rank_normalize(
     indices_addr: Int,
     dest_addr: Int,
     n: Int,
+    total: Int = -1,
 ) abi("C"):
     rank_normalize_impl(
         p(source_addr),
@@ -350,6 +355,7 @@ def mav_rank_normalize(
         p(indices_addr),
         p(dest_addr),
         n,
+        total,
     )
 
 
