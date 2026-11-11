@@ -19,7 +19,7 @@ def sum_values(values: Ptr, start: Int, count: Int) -> Float64:
     var vector_sum = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= count:
-        vector_sum += values.load[width=W](start + i)
+        vector_sum += values.unsafe_load[width=W](start + i)
         i += W
     var scalar_sum = vector_sum.reduce_add()
     while i < count:
@@ -225,12 +225,12 @@ def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
             while offset + W <= half:
                 var even = base + offset
                 var odd = even + half
-                var odd_real = real.load[width=W](odd)
-                var odd_imag = imag.load[width=W](odd)
+                var odd_real = real.unsafe_load[width=W](odd)
+                var odd_imag = imag.unsafe_load[width=W](odd)
                 var tr = wr * odd_real - wi * odd_imag
                 var ti = wr * odd_imag + wi * odd_real
-                var even_real = real.load[width=W](even)
-                var even_imag = imag.load[width=W](even)
+                var even_real = real.unsafe_load[width=W](even)
+                var even_imag = imag.unsafe_load[width=W](even)
                 real.store(even, even_real + tr)
                 imag.store(even, even_imag + ti)
                 real.store(odd, even_real - tr)
@@ -264,8 +264,8 @@ def fft(real: Ptr, imag: Ptr, n: Int, inverse: Bool):
         comptime W = simd_width_of[DType.float64]()
         var i = 0
         while i + W <= n:
-            real.store(i, real.load[width=W](i) * scale)
-            imag.store(i, imag.load[width=W](i) * scale)
+            real.store(i, real.unsafe_load[width=W](i) * scale)
+            imag.store(i, imag.unsafe_load[width=W](i) * scale)
             i += W
         while i < n:
             real[i] *= scale
@@ -312,7 +312,7 @@ def rank_normalize_impl(
     comptime W = simd_width_of[DType.float64]()
     var i = 0
     while i + W <= n:
-        sorted_values.store(i, source.load[width=W](i))
+        sorted_values.store(i, source.unsafe_load[width=W](i))
         var index_values = SIMD[DType.float64, W]()
         comptime for lane in range(Int(W)):
             index_values[lane] = Float64(i + lane)
@@ -498,7 +498,7 @@ def mav_ess(
     var maximum_values = minimum_values
     var scan = 0
     while scan + W <= chains * draws:
-        var current = values.load[width=W](scan)
+        var current = values.unsafe_load[width=W](scan)
         minimum_values = min(minimum_values, current)
         maximum_values = max(maximum_values, current)
         scan += W
@@ -536,7 +536,7 @@ def mav_ess(
         while draw + W <= draws:
             chain_real.store(
                 draw,
-                values.load[width=W](chain * draws + draw) - mean,
+                values.unsafe_load[width=W](chain * draws + draw) - mean,
             )
             draw += W
         while draw < draws:
@@ -545,8 +545,8 @@ def mav_ess(
         fft(chain_real, chain_imag, fft_n, False)
         i = 0
         while i + W <= fft_n:
-            var real_values = chain_real.load[width=W](i)
-            var imag_values = chain_imag.load[width=W](i)
+            var real_values = chain_real.unsafe_load[width=W](i)
+            var imag_values = chain_imag.unsafe_load[width=W](i)
             chain_real.store(
                 i,
                 real_values * real_values + imag_values * imag_values,
